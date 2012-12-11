@@ -170,7 +170,8 @@ src/FrontEnd/HsParser.hs: src/FrontEnd/HsParser.y
 .SECONDARY: _darcs/hashed_inventory src/data/shortchange.txt
 
 ChangeLog:
-	darcs changes --from-tag . > $@
+	touch ChangeLog
+#	darcs changes --from-tag . > $@
 
 src/data/shortchange.txt: ChangeLog
 	echo -n "`sed -ne 's/^  tagged \(.*\)/\1/p' $<`-`grep -c '^  \*' $<`"  > $@
