@@ -19,6 +19,7 @@
 void A_UNUSED
 profile_print_header(FILE *file, char *value_unit)
 {
+#if _JHC_PROFILE
         fprintf(file, "JOB \"%s", jhc_progname);
         for(int i = 0; i < jhc_argc; i++)
                 fprintf(file, " %s", jhc_argv[i]);
@@ -26,9 +27,10 @@ profile_print_header(FILE *file, char *value_unit)
         fprintf(file, "DATE \"%s\"\n", ctime(NULL));
         fprintf(file, "SAMPLE_UNIT \"seconds\"\n");
         fprintf(file, "VALUE_UNIT \"%s\"\n", value_unit ? value_unit : "bytes");
+#endif
 }
 
-#if HAVE_TIMES
+#if HAVE_TIMES && _JHC_PROFILE
 struct profile_stack {
     struct tms tm_total;
     struct tms tm_pushed;
@@ -71,7 +73,8 @@ void jhc_profile_pop(struct profile_stack *ps) {}
 
 void A_COLD
 jhc_print_profile(void) {
-        if(!(_JHC_PROFILE || getenv("JHC_RTS_PROFILE"))) return;
+#if _JHC_PROFILE
+        if(!(getenv("JHC_RTS_PROFILE"))) return;
         fprintf(stderr, "\n-----------------\n");
         fprintf(stderr, "Profiling: %s\n", jhc_progname);
         fprintf(stderr, "Command: %s\n", jhc_command);
@@ -82,11 +85,10 @@ jhc_print_profile(void) {
         times(&tm);
         print_times(&tm);
 #endif
-#if _JHC_PROFILE
         print_times(&gc_gc_time.tm_total);
         print_times(&gc_alloc_time.tm_total);
-#endif
         fprintf(stderr, "-----------------\n");
+#endif
 }
 
 #if _JHC_PROFILE && _JHC_GC != _JHC_GC_JGC
