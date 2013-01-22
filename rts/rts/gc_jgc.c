@@ -3,680 +3,733 @@
 #include "sys/bitarray.h"
 #include "rts/cdefs.h"
 #include "rts/constants.h"
-#include "rts/gc_jgc_internal.h"
 
-#if _JHC_GC == _JHC_GC_JGC
+#include <stdio.h>
+#include "copy_gc.h"
+#include "gc_jgc.h"
 
-gc_t saved_gc;
-struct s_arena *arena;
-static gc_t gc_stack_base;
 
-#define TO_GCPTR(x) (entry_t *)(FROM_SPTR(x))
+#define WORDS_OF(v)   (((v-1)/sizeof(void*))+1)
+#define WORDS_OF_TYPE(type)   WORDS_OF(sizeof(type))
 
-void gc_perform_gc(gc_t gc) A_STD;
-static bool s_set_used_bit(void *val) A_UNUSED;
-static void clear_used_bits(struct s_arena *arena) A_UNUSED;
-static void s_cleanup_blocks(struct s_arena *arena);
-static struct s_block *get_free_block(gc_t gc, struct s_arena *arena);
-static void *jhc_aligned_alloc(unsigned size);
-
-typedef struct {
-        sptr_t ptrs[0];
-} entry_t;
-
-static const void *nh_start, *nh_end;
-
-static bool
-gc_check_heap(entry_t *s)
-{
-        return (s < (entry_t *)nh_start || s > (entry_t *)nh_end);
-}
-
-struct stack {
-        unsigned size;
-        unsigned ptr;
-        entry_t * *stack;
-};
-
-#define EMPTY_STACK { 0, 0, NULL }
-
-static void
-stack_grow(struct stack *s, unsigned grow)
-{
-        s->size += grow;
-        s->stack = realloc(s->stack, sizeof(s->stack[0])*s->size);
-        assert(s->stack);
-        debugf("stack:");
-        for(unsigned i = 0; i < s->ptr; i++) {
-                debugf(" %p", (void *)s->stack[i]);
-        }
-        debugf("\n");
-}
-
-inline static void
-stack_check(struct stack *s, unsigned n) {
-        if(__predict_false(s->size - s->ptr < n)) {
-                stack_grow(s,n + 1024);
-        }
-}
-
-static struct stack root_stack = EMPTY_STACK;
-
-void gc_add_root(gc_t gc, void *root)
-{
-        if(IS_PTR(root)) {
-                entry_t *nroot = TO_GCPTR(root);
-                if(gc_check_heap(nroot)) {
-                        stack_check(&root_stack,1);
-                        root_stack.stack[root_stack.ptr++] = nroot;
-                }
-        }
-}
-
-static void
-gc_add_grey(struct stack *stack, entry_t *s)
-{
-        VALGRIND_MAKE_MEM_DEFINED(s,(S_BLOCK(s))->u.pi.size * sizeof(uintptr_t));
-        if(gc_check_heap(s) && s_set_used_bit(s))
-                stack->stack[stack->ptr++] = s;
-}
-
-void A_STD
-gc_perform_gc(gc_t gc)
-{
-        profile_push(&gc_gc_time);
-        arena->number_gcs++;
-
-        unsigned number_redirects = 0;
-        unsigned number_stack = 0;
-        unsigned number_ptr = 0;
-        struct stack stack = EMPTY_STACK;
-
-        clear_used_bits(arena);
-
-        debugf("Setting Roots:");
-        stack_check(&stack, root_stack.ptr);
-        for(unsigned i = 0; i < root_stack.ptr; i++) {
-                gc_add_grey(&stack, root_stack.stack[i]);
-                debugf(" %p", root_stack.stack[i]);
-        }
-        debugf(" # ");
-        struct StablePtr *sp;
-        LIST_FOREACH(sp, &root_StablePtrs, link) {
-            gc_add_grey(&stack, (entry_t *)sp);
-            debugf(" %p", root_stack.stack[i]);
-        }
-
-        debugf("\n");
-        debugf("Trace:");
-        stack_check(&stack, gc - gc_stack_base);
-        number_stack = gc - gc_stack_base;
-        for(unsigned i = 0; i < number_stack; i++) {
-                debugf(" |");
-                // TODO - short circuit redirects on stack
-                sptr_t ptr = gc_stack_base[i];
-                if(1 && (IS_LAZY(ptr))) {
-                        assert(GET_PTYPE(ptr) == P_LAZY);
-                        VALGRIND_MAKE_MEM_DEFINED(FROM_SPTR(ptr), sizeof(uintptr_t));
-                        if(!IS_LAZY(GETHEAD(FROM_SPTR(ptr)))) {
-                                void *gptr = TO_GCPTR(ptr);
-                                if(gc_check_heap(gptr))
-                                        s_set_used_bit(gptr);
-                                number_redirects++;
-                                debugf(" *");
-                                ptr = (sptr_t)GETHEAD(FROM_SPTR(ptr));
-                        }
-                }
-                if(__predict_false(!IS_PTR(ptr))) {
-                        debugf(" -");
-                        continue;
-                }
-                number_ptr++;
-                entry_t *e = TO_GCPTR(ptr);
-                debugf(" %p",(void *)e);
-                gc_add_grey(&stack, e);
-        }
-        debugf("\n");
-
-        while(stack.ptr) {
-                entry_t *e = stack.stack[--stack.ptr];
-                struct s_block *pg = S_BLOCK(e);
-                if(!(pg->flags & SLAB_MONOLITH))
-                        VALGRIND_MAKE_MEM_DEFINED(e,pg->u.pi.size * sizeof(uintptr_t));
-                debugf("Processing Grey: %p\n",e);
-                unsigned num_ptrs = pg->flags & SLAB_MONOLITH ? pg->u.m.num_ptrs : pg->u.pi.num_ptrs;
-                stack_check(&stack, num_ptrs);
-                for(unsigned i = 0; i < num_ptrs; i++) {
-                        if(1 && (P_LAZY == GET_PTYPE(e->ptrs[i]))) {
-                                VALGRIND_MAKE_MEM_DEFINED(FROM_SPTR(e->ptrs[i]), sizeof(uintptr_t));
-                                if(!IS_LAZY(GETHEAD(FROM_SPTR(e->ptrs[i])))) {
-                                        number_redirects++;
-                                        debugf(" *");
-                                        e->ptrs[i] = (sptr_t)GETHEAD(FROM_SPTR(e->ptrs[i]));
-                                }
-                        }
-                        if(IS_PTR(e->ptrs[i])) {
-                                entry_t * ptr = TO_GCPTR(e->ptrs[i]);
-                                debugf("Following: %p %p\n",e->ptrs[i], ptr);
-                                gc_add_grey( &stack, ptr);
-                        }
-                }
-        }
-        free(stack.stack);
-        s_cleanup_blocks(arena);
-        if (JHC_STATUS) {
-                fprintf(stderr, "%3u - %6u Used: %4u Thresh: %4u Ss: %5u Ps: %5u Rs: %5u Root: %3u\n",
-                        arena->number_gcs,
-                        arena->number_allocs,
-                        (unsigned)arena->block_used,
-                        (unsigned)arena->block_threshold,
-                        number_stack,
-                        number_ptr,
-                        number_redirects,
-                        (unsigned)root_stack.ptr
-                       );
-                arena->number_allocs = 0;
-        }
-        profile_pop(&gc_gc_time);
-}
-
-// 7 to share caches with the first 7 tuples
-#define GC_STATIC_ARRAY_NUM 7
-#define GC_MAX_BLOCK_ENTRIES 150
-
-static struct s_cache *array_caches[GC_STATIC_ARRAY_NUM];
-static struct s_cache *array_caches_atomic[GC_STATIC_ARRAY_NUM];
-
-void
-jhc_alloc_init(void) {
-        VALGRIND_PRINTF("Jhc-Valgrind mode active.\n");
-        saved_gc = gc_stack_base = malloc((1UL << 18)*sizeof(gc_stack_base[0]));
-        arena = new_arena();
-        if(nh_stuff[0]) {
-                nh_end = nh_start = nh_stuff[0];
-                for(int i = 1; nh_stuff[i]; i++) {
-                        if(nh_stuff[i] < nh_start)
-                                nh_start = nh_stuff[i];
-                        if(nh_stuff[i] > nh_end)
-                                nh_end = nh_stuff[i];
-                }
-        }
-        for (int i = 0; i < GC_STATIC_ARRAY_NUM; i++) {
-                find_cache(&array_caches[i], arena, i + 1, i + 1);
-                find_cache(&array_caches_atomic[i], arena, i + 1, 0);
-        }
-}
-
-void
-jhc_alloc_fini(void) {
-        if(_JHC_PROFILE || JHC_STATUS) {
-                fprintf(stderr, "arena: %p\n", arena);
-                fprintf(stderr, "  block_used: %i\n", arena->block_used);
-                fprintf(stderr, "  block_threshold: %i\n", arena->block_threshold);
-                struct s_cache *sc;
-                SLIST_FOREACH(sc,&arena->caches,next)
-                        print_cache(sc);
-        }
-}
-
-heap_t A_STD
-(gc_alloc)(gc_t gc,struct s_cache **sc, unsigned count, unsigned nptrs)
-{
-        assert(nptrs <= count);
-        entry_t *e = s_alloc(gc, find_cache(sc, arena, count, nptrs));
-        VALGRIND_MAKE_MEM_UNDEFINED(e,sizeof(uintptr_t)*count);
-        debugf("gc_alloc: %p %i %i\n",(void *)e, count, nptrs);
-        return (void *)e;
-}
-
-static heap_t A_STD
-s_monoblock(struct s_arena *arena, unsigned size, unsigned nptrs, unsigned flags) {
-        struct s_block *b = jhc_aligned_alloc(size * sizeof(uintptr_t));
-        b->flags = flags | SLAB_MONOLITH;
-        b->color = (sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(1) +
-                    sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
-        b->u.m.num_ptrs = nptrs;
-        SLIST_INSERT_HEAD(&arena->monolithic_blocks, b, link);
-        b->used[0] = 1;
-        return (void *)b + b->color*sizeof(uintptr_t);
-}
-
-// Allocate an array of count garbage collectable locations in the garbage
-// collected heap.
-heap_t A_STD
-gc_array_alloc(gc_t gc, unsigned count)
-{
-        if (!count)
-               return NULL;
-        if (count <= GC_STATIC_ARRAY_NUM)
-                return (wptr_t)s_alloc(gc,array_caches[count - 1]);
-        if (count < GC_MAX_BLOCK_ENTRIES)
-                return s_alloc(gc, find_cache(NULL, arena, count, count));
-        return s_monoblock(arena, count, count, 0);
-        abort();
-}
-
-// Allocate an array of count non-garbage collectable locations in the garbage
-// collected heap.
-heap_t A_STD
-gc_array_alloc_atomic(gc_t gc, unsigned count, unsigned flags)
-{
-        if (!count)
-               return NULL;
-        if (count <= GC_STATIC_ARRAY_NUM && !flags)
-                return (wptr_t)s_alloc(gc,array_caches_atomic[count - 1]);
-        if (count < GC_MAX_BLOCK_ENTRIES && !flags)
-                return s_alloc(gc, find_cache(NULL, arena, count, 0));
-        return s_monoblock(arena, count, count, flags);
-        abort();
-}
-
-/* This finds a bit that isn't set, sets it, then returns its index.  It
- * assumes that a bit is available to be found, otherwise it goes into an
- * infinite loop. */
-
-static unsigned
-bitset_find_free(unsigned *next_free,int n,bitarray_t ba[static n]) {
-        assert(*next_free < (unsigned)n);
-        unsigned i = *next_free;
-        do {
-                int o = __builtin_ffsl(~ba[i]);
-                if(__predict_true(o)) {
-                        ba[i] |= (1UL << (o - 1));
-                        *next_free = i;
-                        return (i*BITS_PER_UNIT + (o - 1));
-                }
-                i = (i + 1) % n;
-                assert(i != *next_free);
-        } while (1);
-}
-
-static void *
-jhc_aligned_alloc(unsigned size) {
-        void *base;
-#if defined(__WIN32__)
-        base = _aligned_malloc(MEGABLOCK_SIZE, BLOCK_SIZE);
-        int ret = !base;
-#elif defined(__ARM_EABI__)
-        base = memalign(BLOCK_SIZE, MEGABLOCK_SIZE);
-        int ret = !base;
-#elif (defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ <  1060)
-        assert(sysconf(_SC_PAGESIZE) == BLOCK_SIZE);
-        base = valloc(MEGABLOCK_SIZE);
-        int ret = !base;
+#ifdef CGC_DEBUG
+#define debug(x,...) printf(x,__VA_ARGS__)
 #else
-        int ret = posix_memalign(&base,BLOCK_SIZE,MEGABLOCK_SIZE);
+#define debug(x,...)
 #endif
-        if(ret != 0) {
-                fprintf(stderr,"Unable to allocate memory for aligned alloc: %u\n", size);
-                abort();
-        }
-        return base;
+void dump_naive(void* ptr,size_t size);
+void dump_small(void*ptr,size_t size_in_words);
+
+
+/*
+ *******************************
+ * LOW LAYER
+ *******************************
+ */
+/* for allocation for page */
+static void* aligned_memblock(size_t size,size_t alignment){
+	void* ptr;
+	int res = posix_memalign(&ptr,alignment,size);
+	if(res != 0) { return NULL;}
+	return ptr;
 }
 
-struct s_megablock *
-s_new_megablock(struct s_arena *arena)
-{
-        struct s_megablock *mb = malloc(sizeof(*mb));
-        mb->base = jhc_aligned_alloc(MEGABLOCK_SIZE);
-        VALGRIND_MAKE_MEM_NOACCESS(mb->base,MEGABLOCK_SIZE);
-        mb->next_free = 0;
-        return mb;
-}
-
-/* block allocator */
-
-static struct s_block *
-get_free_block(gc_t gc, struct s_arena *arena) {
-        arena->block_used++;
-        if(__predict_true(SLIST_FIRST(&arena->free_blocks))) {
-                struct s_block *pg = SLIST_FIRST(&arena->free_blocks);
-                SLIST_REMOVE_HEAD(&arena->free_blocks,link);
-                return pg;
-        } else {
-                if((arena->block_used >= arena->block_threshold)) {
-                        gc_perform_gc(gc);
-                        // if we are still using 80% of the heap after a gc, raise the threshold.
-                        if(__predict_false((unsigned)arena->block_used * 10 >= arena->block_threshold * 9)) {
-                                arena->block_threshold *= 2;
-                        }
-                }
-                if(__predict_false(!arena->current_megablock))
-                        arena->current_megablock = s_new_megablock(arena);
-                struct s_megablock *mb = arena->current_megablock;
-                struct s_block *pg = mb->base + BLOCK_SIZE*mb->next_free;
-                mb->next_free++;
-                if(mb->next_free == MEGABLOCK_SIZE / BLOCK_SIZE) {
-                        SLIST_INSERT_HEAD(&arena->megablocks,mb, next);
-                        arena->current_megablock = NULL;
-                }
-                VALGRIND_MAKE_MEM_UNDEFINED(pg,sizeof(struct s_block));
-                pg->u.pi.num_free = 0;
-                return pg;
-        }
-}
-
-typedef void (*finalizer_ptr)(HsPtr arg);
-typedef void (*finalizer_env_ptr)(HsPtr env, HsPtr arg);
-
-void hs_foreignptr_env_helper(HsPtr env, HsPtr arg) {
-        ((finalizer_ptr)env)(arg);
-}
-
-static void
-s_cleanup_blocks(struct s_arena *arena) {
-        struct s_block *pg = SLIST_FIRST(&arena->monolithic_blocks);
-        SLIST_INIT(&arena->monolithic_blocks);
-        while (pg) {
-                if (pg->used[0]) {
-                        SLIST_INSERT_HEAD(&arena->monolithic_blocks, pg, link);
-                        pg = SLIST_NEXT(pg,link);
-                } else {
-                        if (pg->flags & SLAB_FLAG_FINALIZER) {
-                                HsPtr *ptr = (HsPtr *)pg;
-                                if(ptr[pg->color + 1]) {
-                                        finalizer_ptr *fp = ptr[pg->color + 1];
-                                        do {
-                                                fp[0](ptr[pg->color]);
-                                        } while(*++fp);
-                                }
-                        }
-                        void *ptr = pg;
-                        pg = SLIST_NEXT(pg,link);
-                        free(ptr);
-                }
-        }
-        struct s_cache *sc = SLIST_FIRST(&arena->caches);
-        for(;sc;sc = SLIST_NEXT(sc,next)) {
-                // 'best' keeps track of the block with the fewest free spots
-                // and percolates it to the front, effectively a single pass
-                // of a bubblesort to help combat fragmentation. It does
-                // not increase the complexity of the cleanup algorithm as
-                // we had to scan every block anyway, but over many passes
-                // of the GC it will eventually result in a more sorted list
-                // than would occur by chance.
-
-                struct s_block *best = NULL;
-                int free_best = 4096;
-                pg = SLIST_FIRST(&sc->blocks);
-                struct s_block *fpg = SLIST_FIRST(&sc->full_blocks);
-                SLIST_INIT(&sc->blocks);
-                SLIST_INIT(&sc->full_blocks);
-                if(!pg) {
-                        pg = fpg;
-                        fpg = NULL;
-                }
-                while(pg) {
-                        struct s_block *npg = SLIST_NEXT(pg,link);
-                        if(__predict_false(pg->u.pi.num_free == 0)) {
-                                // Add full blockes to the cache's full block list.
-                                SLIST_INSERT_HEAD(&sc->full_blocks,pg,link);
-                        } else if(__predict_true(pg->u.pi.num_free == sc->num_entries)) {
-                                // Return completely free block to arena free block list.
-                                arena->block_used--;
-                                VALGRIND_MAKE_MEM_NOACCESS((char *)pg + sizeof(struct s_block),
-                                                           BLOCK_SIZE - sizeof(struct s_block));
-                                SLIST_INSERT_HEAD(&arena->free_blocks,pg,link);
-                        } else {
-                                if(!best) {
-                                        free_best = pg->u.pi.num_free;
-                                        best = pg;
-                                } else {
-                                        if(pg->u.pi.num_free < free_best) {
-                                                struct s_block *tmp = best;
-                                                best = pg; pg = tmp;
-                                                free_best = pg->u.pi.num_free;
-                                        }
-                                        SLIST_INSERT_HEAD(&sc->blocks,pg,link);
-                                }
-                        }
-                        if(!npg && fpg) {
-                                pg = fpg;
-                                fpg = NULL;
-                        } else
-                                pg = npg;
-                }
-                if(best)
-                        SLIST_INSERT_HEAD(&sc->blocks,best,link);
-        }
-}
-
-inline static void
-clear_block_used_bits(unsigned num_entries, struct s_block *pg)
-{
-        pg->u.pi.num_free = num_entries;
-        memset(pg->used,0,BITARRAY_SIZE_IN_BYTES(num_entries) - sizeof(pg->used[0]));
-        int excess = num_entries % BITS_PER_UNIT;
-        pg->used[BITARRAY_SIZE(num_entries) - 1] = ~((1UL << excess) - 1);
-#if JHC_VALGRIND
-                unsigned header =  sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(num_entries);
-                VALGRIND_MAKE_MEM_NOACCESS((char *)pg + header, BLOCK_SIZE - header);
-#endif
+/* for small allocation */
+static void* sysmalloc(size_t size){
+	return malloc(size);
 }
 
 /*
- * allocators
+ *******************************
+ * BLOCK ALLOCATORS
+ *******************************
+ */
+#define MEGA_BLOCK_SIZE (1UL << 20)
+#define BLOCK_SIZE      (1UL << 12)
+
+struct s_arena* new_arena(){
+	struct s_arena* arena = (struct s_arena*) malloc(sizeof(struct s_arena));
+	TAILQ_INIT(&arena->blocks);
+	TAILQ_INIT(&arena->free_blocks);
+	SLIST_INIT(&arena->mega_blocks);
+	debug("%s sizeof(single_bdescr) %0x, sizeof(big_bdescr) %0x, sizeof(void*) %0x\n",__FUNCTION__,sizeof(struct single_bdescr),sizeof(struct big_bdescr),sizeof(void*));
+	return arena;
+}
+
+struct mega_bdescr* new_megablock(struct s_arena* arena){
+	struct mega_bdescr* descr = (struct mega_bdescr*) aligned_memblock(MEGA_BLOCK_SIZE,MEGA_BLOCK_SIZE);
+	descr->nblocks = MEGA_BLOCK_SIZE / BLOCK_SIZE;
+	debug("new megablock at %08x\n",(unsigned int)descr);
+	return descr;
+}
+
+void* new_blocks_from_megablock(struct mega_bdescr** mega_block,unsigned int count){
+	int offset_words = count * BLOCK_SIZE;
+	struct mega_bdescr* old_mega_block = (*mega_block);
+	struct mega_bdescr* new_mega_block = (struct mega_bdescr*)(((unsigned char*)old_mega_block) + offset_words);
+	/* if nblocks == count, no more blocks remains and writing over the area causes to memory corruption. */
+	if(old_mega_block->nblocks > count){
+		(*mega_block) = new_mega_block;
+		new_mega_block->nblocks = old_mega_block->nblocks - count;
+	} else {
+		(*mega_block) = NULL;
+	}
+	debug("old megablock : %08x\n",(unsigned int)old_mega_block);
+	debug("new megablock : %08x\n",(unsigned int)new_mega_block);
+	return (void*)old_mega_block;
+}
+
+void* new_blocks(struct s_arena* arena,size_t count){
+	/* TODO better allocation sequence. it will require TAILQ. */
+	struct mega_bdescr*  mega_block = SLIST_FIRST(&(arena->mega_blocks));
+	struct single_bdescr* new_block = NULL;
+	void* new_vblocks = NULL;
+
+	if(count > ( MEGA_BLOCK_SIZE / BLOCK_SIZE)){
+		debug("ERROR: %s cannot allocate size %08x\n",__FUNCTION__,count);
+		return NULL;
+	}
+
+	if(mega_block == NULL){
+		mega_block = new_megablock(arena);
+		SLIST_INSERT_HEAD(&(arena->mega_blocks),mega_block,link);
+	}
+	/* now mega_block is non-NULL */
+	if(mega_block->nblocks <= count) {
+		mega_block = new_megablock(arena);
+		SLIST_INSERT_HEAD(&(arena->mega_blocks),mega_block,link);
+	}
+	SLIST_REMOVE_HEAD(&(arena->mega_blocks),link);
+	new_vblocks = new_blocks_from_megablock(&mega_block,count);
+	if(mega_block != NULL){
+		SLIST_INSERT_HEAD(&(arena->mega_blocks),mega_block,link);
+	}
+	return new_vblocks;
+}
+
+void init_single_block(struct single_bdescr* new_block){
+	new_block->bdescr.type = E_BLOCK_SINGLE;
+	new_block->cur_words = WORDS_OF_TYPE(struct single_bdescr);
+}
+
+struct single_bdescr* new_single_block(struct s_arena* arena){
+	struct single_bdescr* new_block = new_blocks(arena,1);
+	init_single_block(new_block);
+	debug("new single block at %08x\n",(unsigned int)new_block);
+	return new_block;
+}
+
+void init_big_block(struct big_bdescr* new_blocks, unsigned int count){
+	new_blocks->bdescr.type = E_BLOCK_BIG;
+	new_blocks->nblocks = count;
+	new_blocks->size    = 0;
+	new_blocks->nptrs   = 0;
+}
+
+struct big_bdescr* new_big_blocks(struct s_arena* arena, unsigned int count){
+	void* new_block = new_blocks(arena,count);
+	debug("new big block at %08x\n",(unsigned int)new_block);
+	init_big_block(new_block,count);
+	return (struct big_bdescr*)new_block;
+}
+
+/*
+ *******************************
+ * BLOCK POOLS
+ *******************************
  */
 
-heap_t A_STD
-s_alloc(gc_t gc, struct s_cache *sc)
-{
-#if _JHC_PROFILE
-       sc->allocations++;
-       sc->arena->number_allocs++;
+/** finds free single_block, or crete new single_block */
+struct single_bdescr* find_new_single_block(struct s_arena* arena){
+	struct single_bdescr* res = (struct single_bdescr*)TAILQ_FIRST(&(arena->free_blocks));
+	if(res == NULL){
+		res = new_single_block(arena);
+	}else{
+		TAILQ_REMOVE(&(arena->free_blocks),TAILQ_FIRST(&(arena->free_blocks)),link);
+	}
+	init_single_block(res);
+	return res;
+}
+
+/** returns recent used block, if no block, augments new block and returns it. */
+struct single_bdescr* find_current_single_block(struct s_arena* arena){
+	struct single_bdescr* res = (struct single_bdescr*)TAILQ_FIRST(&(arena->blocks));
+	if(res == NULL){
+		res = find_new_single_block(arena);
+		TAILQ_INSERT_HEAD(&(arena->blocks),(struct bdescr*)res,link);
+	}
+	return res;
+}
+
+/** prepend new block to currently used blocks */
+void prepend_new_single_block(struct s_arena* arena){
+	struct single_bdescr* block = find_new_single_block(arena);
+	TAILQ_INSERT_HEAD(&(arena->blocks),(struct bdescr*)block,link);
+}
+
+/** prepend block to free block list. note this function does not remove it from live blocks */
+void free_single_block(struct s_arena* arena,struct single_bdescr* block){
+	TAILQ_INSERT_HEAD(&(arena->free_blocks),(struct bdescr*)block,link);
+}
+
+/** new big_block allocated. */
+struct big_bdescr* find_new_big_blocks(struct s_arena* arena, unsigned int count){
+	struct big_bdescr* big_block = new_big_blocks(arena,count);
+	TAILQ_INSERT_HEAD(&(arena->big_blocks),(struct bdescr*)big_block,link);
+	return big_block;
+}
+
+/** prepend big block to free block list. note this function does not remove it from live blocks */
+void free_big_block(struct s_arena* arena,struct big_bdescr* block){
+	unsigned int count = block->nblocks;
+	void* vblock = (void*) block;
+	/* moved to caller responsibility. */
+	/*
+	TAILQ_REMOVE(&(arena->free_blocks),(struct bdescr*)block,bdescr,link);
+	*/
+	for(;count >0 ; count--){
+		struct single_bdescr* single_block = (struct single_bdescr*)vblock;
+		init_single_block(single_block);
+		TAILQ_INSERT_HEAD(&(arena->free_blocks),(struct bdescr*)single_block,link);
+		vblock += (BLOCK_SIZE / sizeof(void*));
+	}
+}
+
+/*
+ *******************************
+ * High Level Allocators
+ *******************************
+ */
+#define BIG_THREASHOLD (256/sizeof(void*))
+#define GET_SIZE(x)   (((*(((unsigned int*)x)-1))>> 2) & 0x3ff)
+#define SET_SIZE(x,s) do{*(((unsigned int*)x)-1)|=((s&0x3ff)<< 2);}while(0)
+#define GET_NPTR(x)   (((*(((unsigned int*)x)-1))>>12) & 0x3ff)
+#define SET_NPTR(x,n) do{*(((unsigned int*)x)-1)|=((n&0x3ff)<<12);}while(0)
+
+/** allocate big block */
+static void* mem_big_allocate(struct s_arena* arena, size_t size_in_words, unsigned int nptrs){
+	unsigned int block_counts = ((WORDS_OF_TYPE(struct big_bdescr)+size_in_words-1)*sizeof(void*))/BLOCK_SIZE + 1;
+	debug("%s big_block size_in_words: %d block_counts : %d\n",__FUNCTION__,size_in_words,block_counts);
+	struct big_bdescr* big_block = find_new_big_blocks(arena,block_counts);
+	big_block-> size = size_in_words;
+	big_block->nptrs = nptrs;
+	return sizeof(struct big_bdescr) + (unsigned char*)big_block;
+}
+
+/** allocate small block */
+static void* mem_small_allocate(struct s_arena* arena, size_t size_in_words, unsigned int nptrs){
+	void* ptr;
+ 	struct single_bdescr* single_block = find_current_single_block(arena);
+	const int block_offset_words = WORDS_OF_TYPE(struct single_bdescr);
+
+	if((single_block->cur_words + size_in_words +1)*sizeof(void*) > BLOCK_SIZE){
+		/* no space to alloc */
+		/* clear trailing area */
+		debug("%s : 1 single_bloc %08x cur_words %08x target %08x\n",__FUNCTION__,single_block,single_block->cur_words,(unsigned int)(((void**) single_block)+single_block->cur_words));
+		*(((void**) single_block)+single_block->cur_words) = NULL;
+		prepend_new_single_block(arena);
+ 		single_block = find_current_single_block(arena);
+	}
+	/* allocated ptr is now fixed. */
+	ptr = (void*)((void**)single_block + ((single_block->cur_words) +1));
+	single_block->cur_words += size_in_words + 1;
+	debug("%s : 2 single_bloc %08x cur_words %08x target %08x\n",__FUNCTION__,single_block,single_block->cur_words,(((void**) single_block)+single_block->cur_words));
+	*(((void**) single_block)+single_block->cur_words) = NULL;
+	if((single_block->cur_words + 1)*sizeof(void*) < BLOCK_SIZE){
+		*(((void**) single_block)+(single_block->cur_words +1)) = NULL;
+	}
+	if((single_block->cur_words + size_in_words +1)*sizeof(void*) > BLOCK_SIZE){
+		debug("%s : 3 single_bloc %08x cur_words %08x target %08x\n",__FUNCTION__,single_block,single_block->cur_words,(((void**) single_block)+single_block->cur_words));
+		/* no space to alloc */
+		/* clear trailing area */
+		*(((void**) single_block)+single_block->cur_words) = NULL;
+		prepend_new_single_block(arena);
+ 		single_block = find_current_single_block(arena);
+	}
+	SET_SIZE(ptr,size_in_words);
+	SET_NPTR(ptr,nptrs);
+	debug("%s small_block size : %d size_in_words : %d\n",__FUNCTION__,size_in_words*4,size_in_words);
+	return ptr;
+}
+
+/** allocate memory despite of its size */
+void* mem_allocate(struct s_arena* arena, size_t size_in_words, unsigned int nptrs){
+	void* ptr;
+	if( size_in_words > BIG_THREASHOLD){
+		ptr = mem_big_allocate(arena,size_in_words,nptrs);
+	}else{
+		ptr = mem_small_allocate(arena,size_in_words,nptrs);
+	}
+	return (void*)ptr;
+}
+
+/** allocate memory with finalizer. this function is not tested. */
+void* mem_allocate_with_finalizer(struct s_arena* arena, size_t size, unsigned int nptrs,void (*finalizer)()){
+	/* BIG */
+	/* TODO ADD FILNALIZER SUPPORT */
+	void* ptr;
+	unsigned int block_counts = (sizeof(struct big_bdescr)+sizeof(void*)*size-1)/BLOCK_SIZE + 1;
+	struct big_bdescr* big_block = find_new_big_blocks(arena,block_counts);
+	big_block-> size = size;
+	big_block->nptrs = nptrs;
+	ptr = (sizeof(struct big_bdescr)/sizeof(void*)) + (void*)big_block;
+	return ptr;
+}
+
+/*
+ *******************************
+ * GC
+ *******************************
+ */
+#define GET_BLOCK(x)  ((void*)(((unsigned int)x) & (~(BLOCK_SIZE - 1))))
+#define SAVED_BITS(x) (((unsigned int)x) & 0x3)
+#define PTR_BITS(x)   ((void*)(((unsigned int)x) & ~(0x3)))
+#define BLOCK_TYPE(x) (((struct bdescr*)GET_BLOCK(x))->type)
+
+#define FORWARD_MASK  0x1
+#define IS_FORWARDED(x)  (((*(((unsigned int*)x)-1)) & FORWARD_MASK) == FORWARD_MASK)
+#define FORWARDED_PTR(x) ((void*)(PTR_BITS(*(unsigned int*)(((void**)x) -1))))
+
+struct s_gc{
+	struct s_arena* arena;
+	TAILQ_HEAD( , bdescr) big_live_queue;
+	struct big_bdescr* scavenging_big_object;
+	TAILQ_HEAD( , bdescr) to_space_queue;
+	struct single_bdescr* to_space;
+	void* scavenging_object; 
+	unsigned long small_evaced;
+	unsigned long big_evaced;
+};
+
+void evacuate(void** src, struct s_gc* s_gc);
+void scavenge_small(void* obj, struct s_gc* s_gc);
+void evacuate_small(void** src, struct s_gc* s_gc);
+void scavenge_big(void* obj, struct s_gc* s_gc);
+void evacuate_big(void** src, struct s_gc* s_gc);
+void* find_small_object(struct s_gc* s_gc);
+void* find_big_object(struct s_gc* s_gc);
+
+static void init_gc(struct s_gc* s_gc,struct s_arena* arena){
+	s_gc->arena = arena;
+	TAILQ_INIT(&(s_gc->big_live_queue));
+	s_gc->scavenging_big_object = NULL;
+	TAILQ_INIT(&(s_gc->to_space_queue));
+	s_gc->to_space = NULL;
+	s_gc->scavenging_object = NULL;
+	s_gc->small_evaced = 0;
+	s_gc->big_evaced = 0;
+}
+
+/* root must be alligned as sizeof(void*) */
+void mem_add_root(struct s_arena* arena, void** root){
+	arena->root = root;
+}
+
+ 
+void perform_gc(gc_t gc,struct s_arena* arena){
+	struct s_gc s_gc;
+	init_gc(&s_gc,arena);
+
+	/* phase 1 mark or evac root */
+	evacuate(arena->root,&s_gc);
+	void** ptr_top = NULL;
+	for(ptr_top = (void**)*gc;(*ptr_top) != NULL;){
+		void** ptr = ptr_top;
+		for(;(*ptr) != NULL;ptr++){
+			evacuate(ptr,&s_gc);
+		}
+		if( ptr_top == ptr ){
+			break;
+		} else {
+			ptr_top = *(ptr+1);
+		}
+	}
+	
+	/* phase 2 process scavenge queue */
+	do{
+		void* scav_obj;
+		scav_obj  = find_small_object(&s_gc);
+		if( scav_obj != NULL){
+			scavenge_small(scav_obj,&s_gc);
+			continue;
+		}
+		scav_obj  = find_big_object(&s_gc);
+		if( scav_obj != NULL){
+			scavenge_big(scav_obj,&s_gc);
+			continue;
+		}
+		/* no scavenging object */
+		break;
+	}while( 1 );
+
+	debug("========================================================\n",NULL);
+	debug("%s : small %016x(%d) big %016x(%d)\n",__FUNCTION__,s_gc.small_evaced,s_gc.small_evaced,s_gc.big_evaced,s_gc.big_evaced);
+	debug("========================================================\n",NULL);
+	
+	/* phase 3 adjust objects */
+	/* big dead objects : free */
+	struct bdescr* block;
+	block =  TAILQ_FIRST(&(arena->big_blocks));
+	while(block){
+		debug("-",NULL);
+		struct bdescr* new_block = TAILQ_NEXT(block,link);
+		debug("%s : %08x dead big\n",__FUNCTION__,(unsigned int)block);
+		/* finalize */
+		/* TODO if any finalizer, call here (before small blocks released)*/
+		free_big_block(arena,(struct big_bdescr*)block);
+		block = new_block;
+	}
+
+	/* big live objects : clear used bit & move to arena->blocks */
+	TAILQ_INIT(&(arena->big_blocks));
+	TAILQ_CONCAT(&(arena->big_blocks),&(s_gc.big_live_queue),link);
+
+	block =  TAILQ_FIRST(&(arena->big_blocks));
+	while(block){
+		debug("+",NULL);
+		struct bdescr* new_block = TAILQ_NEXT(block,link);
+		debug("%s : %08x live big\n",__FUNCTION__,(unsigned int)block);
+		((struct big_bdescr*)block)-> used = 0;
+		block = new_block;
+	}
+
+	/* free old spaces */
+	block = TAILQ_FIRST(&(arena->blocks));
+	while(block){
+		debug("-",NULL);
+		struct bdescr* next_block = TAILQ_NEXT(block,link);
+		free_single_block(arena,(struct single_bdescr*)block);
+		debug("%s : %08x dead small\n",__FUNCTION__,(unsigned int)block);
+		block = next_block;
+	}
+
+	/* move live small area */
+	TAILQ_INIT(&(arena->blocks));
+	TAILQ_CONCAT(&(arena->blocks),&(s_gc.to_space_queue),link);
+
+#ifdef CGC_DEBUG
+	block = TAILQ_FIRST(&(arena->blocks));
+	while(block){
+		debug("+",NULL);
+		struct bdescr* next_block = TAILQ_NEXT(block,link);
+		debug("%s : %08x live small\n",__FUNCTION__,(unsigned int)block);
+		block = next_block;
+	}
 #endif
-        struct s_block *pg = SLIST_FIRST(&sc->blocks);
-        if(__predict_false(!pg)) {
-                pg = get_free_block(gc, sc->arena);
-                VALGRIND_MAKE_MEM_NOACCESS(pg, BLOCK_SIZE);
-                VALGRIND_MAKE_MEM_DEFINED(pg, sizeof(struct s_block));
-                if(sc->num_entries != pg->u.pi.num_free)
-                        VALGRIND_MAKE_MEM_UNDEFINED((char *)pg->used,
-                                                    BITARRAY_SIZE_IN_BYTES(sc->num_entries));
-                else
-                        VALGRIND_MAKE_MEM_DEFINED((char *)pg->used,
-                                                  BITARRAY_SIZE_IN_BYTES(sc->num_entries));
-                assert(pg);
-                pg->flags = sc->flags;
-                pg->color = sc->color;
-                pg->u.pi.num_ptrs = sc->num_ptrs;
-                pg->u.pi.size = sc->size;
-                pg->u.pi.next_free = 0;
-                SLIST_INSERT_HEAD(&sc->blocks,pg,link);
-                if(sc->num_entries != pg->u.pi.num_free)
-                        clear_block_used_bits(sc->num_entries, pg);
-                pg->used[0] = 1; //set the first bit
-                pg->u.pi.num_free = sc->num_entries - 1;
-                return (uintptr_t *)pg + pg->color;
-        } else {
-                __builtin_prefetch(pg->used,1);
-                pg->u.pi.num_free--;
-                unsigned next_free = pg->u.pi.next_free;
-                unsigned found = bitset_find_free(&next_free,BITARRAY_SIZE(sc->num_entries),pg->used);
-                pg->u.pi.next_free = next_free;
-                void *val = (uintptr_t *)pg + pg->color + found*pg->u.pi.size;
-                if(__predict_false(0 == pg->u.pi.num_free)) {
-                        assert(pg == SLIST_FIRST(&sc->blocks));
-                        SLIST_REMOVE_HEAD(&sc->blocks,link);
-                        SLIST_INSERT_HEAD(&sc->full_blocks,pg,link);
-                }
-                assert(S_BLOCK(val) == pg);
-                //printf("s_alloc: val: %p s_block: %p size: %i color: %i found: %i num_free: %i\n", val, pg, pg->pi.size, pg->pi.color, found, pg->num_free);
-                return val;
-        }
+	debug("========================================================\n",NULL);
+	debug("%s : end\n",__FUNCTION__);
+	debug("========================================================\n",NULL);
 }
 
-struct s_cache *
-new_cache(struct s_arena *arena, unsigned short size, unsigned short num_ptrs)
-{
-        struct s_cache *sc = malloc(sizeof(*sc));
-        memset(sc,0,sizeof(*sc));
-        sc->arena = arena;
-        sc->size = size;
-        sc->num_ptrs = num_ptrs;
-        sc->flags = 0;
-        size_t excess = BLOCK_SIZE - sizeof(struct s_block);
-        sc->num_entries = (8*excess) / (8*sizeof(uintptr_t)*size + 1) - 1;
-        sc->color = (sizeof(struct s_block) + BITARRAY_SIZE_IN_BYTES(sc->num_entries) +
-                        sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
-        SLIST_INIT(&sc->blocks);
-        SLIST_INIT(&sc->full_blocks);
-        SLIST_INSERT_HEAD(&arena->caches,sc,next);
-        return sc;
+/* pop object to be scavenged. */
+void* find_small_object(struct s_gc* s_gc){
+	size_t size_in_words;
+	void** next_object = NULL;
+	struct single_bdescr* to_space;
+	if(s_gc->scavenging_object == NULL){
+		/* not initialized :  scavenging_object points to the before head. */
+		to_space = (struct single_bdescr*)TAILQ_FIRST(&(s_gc->to_space_queue));
+		debug("%s : to_space : %08x\n",__FUNCTION__,(unsigned int)to_space);
+		if(to_space == NULL){
+			/* no to_space. no object to scavenge. */
+			debug("%s : no to_space\n",__FUNCTION__);
+			return NULL;
+		}
+		s_gc->scavenging_object = (void*)(((void**)to_space)+(WORDS_OF_TYPE(struct single_bdescr)) + 1);
+	}
+	size_in_words = GET_SIZE(s_gc->scavenging_object);
+	to_space = (struct single_bdescr*)GET_BLOCK(s_gc->scavenging_object);
+	debug("%s : scavenging object : %08x size : %08x\n",__FUNCTION__,(unsigned int)s_gc->scavenging_object,size_in_words);
+	if(size_in_words == 0){
+		/* not found at s_gc->scavenging_object. but may be found in next block. */
+		to_space = (struct single_bdescr*)TAILQ_NEXT((struct bdescr*)to_space,link);
+		if(to_space == NULL){
+			/* no to_space. no object to scavenge. */
+			return NULL;
+		}
+		void* next_scavenging_object = (void*)(((void**)to_space)+(WORDS_OF_TYPE(struct single_bdescr)) + 1);
+		size_in_words = GET_SIZE(next_scavenging_object);
+		if(size_in_words == 0){
+			/* do not update scavenging object pointer */
+			return NULL;
+		}
+		/* next scavenging object found */
+		s_gc->scavenging_object = next_scavenging_object;
+	}
+
+	next_object = s_gc->scavenging_object;
+
+	/* shifting s_gc->scavenging_object */
+	/* now to_space points to the object found. */
+	if(next_object + size_in_words + 2 <= ((void**)to_space) + (BLOCK_SIZE/sizeof(void*))){
+		/* enough space. safely shitt the  s_gc->scavenging_object */
+		debug("%s : old scavenging object : %08x size : %08x\n",__FUNCTION__,(unsigned int)s_gc->scavenging_object,size_in_words);
+		s_gc->scavenging_object = (void*)(next_object + size_in_words +1);
+		debug("%s : new scavenging object : %08x size : %08x\n",__FUNCTION__,(unsigned int)s_gc->scavenging_object,size_in_words);
+	} else {
+		debug("%s : terrible point\n",__FUNCTION__);
+		/* shift to next page */
+		to_space = (struct single_bdescr*)TAILQ_NEXT((struct bdescr*)to_space,link);
+		if(to_space == NULL){
+			/* force prepare for next page */
+			debug("%s : force prepare for next page\n",__FUNCTION__);
+			struct single_bdescr* new_block = find_new_single_block(s_gc->arena);
+			TAILQ_INSERT_TAIL(&(s_gc->to_space_queue),(struct bdescr*)new_block,link);
+		}
+		debug("%s : old scavenging object : %08x size : %08x\n",__FUNCTION__,(unsigned int)s_gc->scavenging_object,size_in_words);
+		s_gc->scavenging_object = (void*)(((void**)to_space)+(WORDS_OF_TYPE(struct single_bdescr)) + 1);
+		debug("%s : new scavenging object : %08x size : %08x\n",__FUNCTION__,(unsigned int)s_gc->scavenging_object,size_in_words);
+	}
+
+	return (void*)next_object;
 }
 
-// clear all used bits, must be followed by a marking phase.
-static void
-clear_used_bits(struct s_arena *arena)
-{
-        struct s_block *pg;
-        SLIST_FOREACH(pg, &arena->monolithic_blocks, link)
-            pg->used[0] = 0;
-        struct s_cache *sc = SLIST_FIRST(&arena->caches);
-        for(;sc;sc = SLIST_NEXT(sc,next)) {
-                SLIST_FOREACH(pg, &sc->blocks, link)
-                    clear_block_used_bits(sc->num_entries,pg);
-                SLIST_FOREACH(pg, &sc->full_blocks, link)
-                    clear_block_used_bits(sc->num_entries,pg);
-        }
+/* pop object to be scavenged. */
+void* find_big_object(struct s_gc* s_gc){
+	struct big_bdescr* big_block = NULL;
+	/* two quite similar pathes exist. but we don't merge them for later debugging. */
+	if(s_gc->scavenging_big_object == NULL){
+		/* not initialized :  scavenging_big_object points to the before head. */
+		big_block = (struct big_bdescr*)TAILQ_FIRST(&(s_gc->big_live_queue));
+		if(big_block != NULL){
+			/* object to scavenge */
+			s_gc->scavenging_big_object = big_block;
+		} else{
+			/* no object to scavenge, waiting for any object to be scavenged */
+			/* if  find_small_object works well, this may not happen */
+			debug("%s : no object found.\n",__FUNCTION__);
+			return NULL;
+		}
+	}else{
+		big_block = (struct big_bdescr*)TAILQ_NEXT((struct bdescr*)s_gc->scavenging_big_object,link);
+		if(big_block != NULL){
+			s_gc->scavenging_big_object = big_block;
+		} else {
+			debug("%s : no object found: big object reached to the tail\n",__FUNCTION__);
+			return NULL;
+		}
+	}
+	return (void*)(( (void**)big_block)+WORDS_OF_TYPE(struct big_bdescr));
 }
 
-// Set a used bit. returns true if the tagged node should be scanned by the GC.
-// this happens when the used bit was not previously set and the node contains
-// internal pointers.
-
-static bool
-s_set_used_bit(void *val)
-{
-        assert(val);
-        struct s_block *pg = S_BLOCK(val);
-        unsigned int offset = ((uintptr_t *)val - (uintptr_t *)pg) - pg->color;
-        if(__predict_true(BIT_IS_UNSET(pg->used,offset/pg->u.pi.size))) {
-                if (pg->flags & SLAB_MONOLITH) {
-                        pg->used[0] = 1;
-                        return (bool)pg->u.m.num_ptrs;
-
-                } else {
-                        BIT_SET(pg->used,offset/pg->u.pi.size);
-                        pg->u.pi.num_free--;
-                        return (bool)pg->u.pi.num_ptrs;
-                }
-        }
-        return false;
+/* create to space if neccesarry (can't store the size of the object) */
+void check_to_space(size_t size_in_word,struct s_gc* s_gc){
+	struct single_bdescr* to_space = (struct single_bdescr*)TAILQ_FIRST(&(s_gc->to_space_queue));
+	if(to_space == NULL || (to_space->cur_words+size_in_word)*sizeof(void*) > BLOCK_SIZE){
+		if(to_space != NULL){
+			/* mark this area is not used. */
+			*(to_space->cur_words+(void**)to_space) = NULL;
+		}
+		/* prepare next to_space */
+		to_space = find_new_single_block(s_gc->arena);
+		TAILQ_INSERT_TAIL(&(s_gc->to_space_queue),(struct bdescr*)to_space,link);
+	}
+	s_gc->to_space = to_space;
 }
 
-struct s_cache *
-find_cache(struct s_cache **rsc, struct s_arena *arena,
-           unsigned short size, unsigned short num_ptrs)
-{
-        if(__predict_true(rsc && *rsc))
-                return *rsc;
-        struct s_cache *sc = SLIST_FIRST(&arena->caches);
-        for(;sc;sc = SLIST_NEXT(sc,next)) {
-                if(sc->size == size && sc->num_ptrs == num_ptrs)
-                        goto found;
-        }
-        sc = new_cache(arena,size,num_ptrs);
-found:
-        if(rsc)
-                *rsc = sc;
-        return sc;
+void** copy_obj(void** obj,struct single_bdescr* to_space,size_t size_in_word){
+	void** new_ptr = ((void**)to_space)+to_space->cur_words+1;
+	debug("%s : new_ptr %08x to_space %08x src_obj %08x size %d\n",__FUNCTION__,new_ptr,to_space,obj,size_in_word);
+	dump_small(obj,size_in_word);
+	int i;
+	*(new_ptr-1) = *(obj-1);
+	for(i = 0;i<size_in_word;i++){
+		*(new_ptr+i) = *(obj+i);
+	}
+	/* if this is the same block, empty word next to me. */
+	if(((void**)to_space) == (void**)GET_BLOCK(new_ptr+size_in_word)){
+		*(new_ptr+size_in_word) = NULL;
+		dump_small(new_ptr,size_in_word);
+	} else {
+		dump_small(new_ptr,size_in_word-1);
+	}
+	to_space->cur_words += size_in_word+1;
+	return new_ptr;
 }
 
-struct s_arena *
-new_arena(void) {
-        struct s_arena *arena = malloc(sizeof(struct s_arena));
-        SLIST_INIT(&arena->caches);
-        SLIST_INIT(&arena->free_blocks);
-        SLIST_INIT(&arena->megablocks);
-        SLIST_INIT(&arena->monolithic_blocks);
-        arena->block_used = 0;
-        arena->block_threshold = 8;
-        arena->current_megablock = NULL;
-        return arena;
+/* *src is a tag tainted pointer */
+void evacuate_small(void** src, struct s_gc* s_gc){
+	void** obj_ptr = (void**) PTR_BITS(*src);
+	if(IS_FORWARDED(obj_ptr)){
+		debug("%s : pointer forwarded : %08x\n",__FUNCTION__,obj_ptr);
+		void** new_ptr = FORWARDED_PTR(obj_ptr);
+		/* UPDATING SOURCE (with tag) */
+		*(src)         = (void*)((unsigned int) new_ptr | SAVED_BITS(*src));
+	} else{
+		void** new_ptr;
+		size_t size_in_word = GET_SIZE(obj_ptr);
+		check_to_space(size_in_word,s_gc);
+		/* remember new_pointer points to preceding info area. */
+		new_ptr = copy_obj(obj_ptr,s_gc->to_space,size_in_word);
+		/* FORWARDING POINTER (with forward tag) */
+		*((obj_ptr)-1) = (void*)(FORWARD_MASK | (unsigned int)(new_ptr));
+		/* UPDATING SOURCE (with tag) */
+		*(src)         = (void*)((unsigned int) (new_ptr) | SAVED_BITS(*src));
+		debug("%s : evacuated. the old object is now as below:\n",__FUNCTION__);
+		dump_small(obj_ptr,size_in_word);
+		s_gc->small_evaced ++;
+	}
+}
+	
+/* *src is a tag tainted pointer */
+void evacuate_big(void** src, struct s_gc* s_gc){
+	struct big_bdescr* big_block = (struct big_bdescr*)GET_BLOCK(*src);
+	if(! big_block->used){
+		TAILQ_REMOVE(&(s_gc->arena->big_blocks),(struct bdescr*)big_block,link);
+		TAILQ_INSERT_TAIL(&(s_gc->big_live_queue),(struct bdescr*)big_block,link);
+		big_block->used = 1;
+		s_gc->big_evaced ++;
+	}
 }
 
-uint32_t
-get_heap_flags(void * sp) {
-        uint32_t ret = 0;
-        switch (GET_PTYPE(sp)) {
-        case P_VALUE: return SLAB_VIRTUAL_VALUE;
-        case P_FUNC: return SLAB_VIRTUAL_FUNC;
-        case P_LAZY:
-                     ret |= SLAB_VIRTUAL_LAZY;
-        case P_WHNF:
-                     if (S_BLOCK(sp) == NULL)
-                             return (ret | SLAB_VIRTUAL_SPECIAL);
-                     if ((void *)sp >= nh_start && (void *)sp <= nh_end)
-                             return (ret | SLAB_VIRTUAL_CONSTANT);
-                     return ret |= S_BLOCK(sp)->flags;
-        }
-        return ret;
+void scavenge_small(void *obj, struct s_gc* s_gc){
+	void** obj_ptr = (void**)obj;
+	unsigned int nptrs = GET_NPTR(obj);
+	debug("%s : obj   %08x nptr: %d (s:%d n:%d)\n",__FUNCTION__,(unsigned int)(obj),nptrs,GET_SIZE(obj),GET_NPTR(obj));
+	for(;nptrs > 0;nptrs--){
+		evacuate(obj_ptr,s_gc);
+		obj_ptr++;
+	}
 }
 
-heap_t A_STD
-gc_malloc_foreignptr(unsigned alignment, unsigned size, bool finalizer) {
-        // we don't allow higher alignments yet.
-        assert (alignment <= sizeof(uintptr_t));
-        // no finalizers yet
-        assert (!finalizer);
-        unsigned spacing = 1 + finalizer;
-        wptr_t *res = gc_array_alloc_atomic(saved_gc, spacing + TO_BLOCKS(size),
-                                             finalizer ? SLAB_FLAG_FINALIZER : SLAB_FLAG_NONE);
-        res[0] = (wptr_t)(res + spacing);
-        if (finalizer)
-                res[1] = NULL;
-        return TO_SPTR(P_WHNF, res);
+void scavenge_big(void *obj, struct s_gc* s_gc){
+	struct big_bdescr* big_block = (struct big_bdescr*)GET_BLOCK(obj);
+	unsigned int nptrs = big_block->nptrs;
+	void** obj_ptr = (void**)obj;
+	debug("%s : obj   %08x\n",__FUNCTION__,(unsigned int)(obj));
+	for(;nptrs > 0;nptrs--){
+		evacuate(obj_ptr,s_gc);
+		obj_ptr++;
+	}
+	
 }
 
-heap_t A_STD
-gc_new_foreignptr(HsPtr ptr) {
-        HsPtr *res = gc_array_alloc_atomic(saved_gc, 2, SLAB_FLAG_FINALIZER);
-        res[0] = ptr;
-        res[1] = NULL;
-        return TO_SPTR(P_WHNF, res);
+void evacuate(void** src, struct s_gc* s_gc){
+	debug("%s : *src  %08x\n",__FUNCTION__,(unsigned int)(*src));
+	debug("%s : BLOCK %08x\n",__FUNCTION__,(unsigned int)GET_BLOCK(*src));
+	enum e_descr_type e = BLOCK_TYPE(*src);
+
+	if (e == E_BLOCK_SINGLE){
+		debug("%s : small\n",__FUNCTION__);
+		evacuate_small(src,s_gc);
+	} else if (e == E_BLOCK_BIG){
+		debug("%s : big\n",__FUNCTION__);
+		evacuate_big(src,s_gc);
+	} else {
+		debug("ERROR: %s : %s : %08x\n", __FUNCTION__,"unknown object type",(unsigned int)e);
+		debug("ERROR: %s : BIG %08x SINGLE %08x\n", __FUNCTION__,E_BLOCK_BIG,E_BLOCK_SINGLE);
+	}
 }
 
-bool A_STD
-gc_add_foreignptr_finalizer(wptr_t fp, HsFunPtr finalizer) {
-        if (!(SLAB_FLAG_FINALIZER & get_heap_flags(fp)))
-                return false;
-        HsFunPtr **res = (HsFunPtr**)FROM_SPTR(fp);
-        unsigned len = 0;
-        if (res[1])
-                while(res[1][len++]);
-        else
-                len = 1;
-        res[1] = realloc(res[1], (len + 1) * sizeof(HsFunPtr));
-        HsFunPtr *ptrs = res[1];
-        ptrs[len - 1] = finalizer;
-        ptrs[len] = NULL;
-        return true;
-}
-
-void
-print_cache(struct s_cache *sc) {
-        fprintf(stderr, "num_entries: %i with %lu bytes of header\n",
-                (int)sc->num_entries, sizeof(struct s_block) +
-                BITARRAY_SIZE_IN_BYTES(sc->num_entries));
-        fprintf(stderr, "  size: %i words %i ptrs\n",
-                (int)sc->size,(int)sc->num_ptrs);
-#if _JHC_PROFILE
-        fprintf(stderr, "  allocations: %lu\n", (unsigned long)sc->allocations);
+/** debug function. dump to stdout. */
+void dump_naive(void* ptr,size_t size){
+#ifdef CGC_DEBUG
+	unsigned char* p = ((unsigned char*)ptr);
+	const int unit = 16;
+	int i;
+	for( i = 0; i < size  ; i++){
+		switch( (i+1)%unit ){
+		case 0:
+			printf("%02x\n",*(p+i));	
+			break;
+		case 1:
+			printf("%08x : %02x ",(unsigned int)(p+i),*(p+i));
+			break;
+		default:
+			printf("%02x ",*(p+i));
+			break;
+		}
+#ifndef NO_SHORT_DUMP
+		if((i == 31) && (size > 64) ){
+			printf("       :\n");
+			i += ((size / 16) -sizeof(void*)) * 16;
+		}
 #endif
-        if(SLIST_EMPTY(&sc->blocks) && SLIST_EMPTY(&sc->full_blocks))
-                return;
-        fprintf(stderr, "  blocks:\n");
-        fprintf(stderr, "%20s %9s %9s %s\n", "block", "num_free", "next_free", "status");
-        struct s_block *pg;
-        SLIST_FOREACH(pg,&sc->blocks,link)
-            fprintf(stderr, "%20p %9i %9i %c\n", pg, pg->u.pi.num_free, pg->u.pi.next_free, 'P');
-        SLIST_FOREACH(pg,&sc->full_blocks,link)
-            fprintf(stderr, "%20p %9i %9i %c\n", pg, pg->u.pi.num_free, pg->u.pi.next_free, 'F');
-}
-
-void hs_perform_gc(void) {
-        gc_perform_gc(saved_gc);
-}
-
+	}
+	if( (i % unit) != 0){
+		printf("\n");
+	}
 #endif
+}
+
+/** debug function. dump to stdout. */
+void dump_small(void*ptr,size_t size_in_words){
+#ifdef CGC_DEBUG
+	void* head = *(((void**)ptr)-1);
+	if(((unsigned int)head) & 0x01 != 0){
+		printf("ptr : %08x\n",head);
+	} else {
+		int size = GET_SIZE(ptr);
+		int nptr = GET_NPTR(ptr);
+		printf("size : %08x(%d) nptrs : %08x(%d) (ptr : %08x)\n",size,size,nptr,nptr,head);
+	}
+	dump_naive(ptr-sizeof(void*),sizeof(void*)*(size_in_words+2));
+#endif
+}
+
+
+/*
+ *********************************************
+ *  glue implementation
+ *********************************************
+ */
+
+void* gc_null_val = NULL;
+gc_t saved_gc;
+struct s_arena *arena;
+
+void jhc_alloc_init(void){
+	arena = new_arena();
+	saved_gc = &(gc_null_val);
+}
+
+void jhc_alloc_fini(void){
+	free(arena);
+	arena = NULL;
+}
+
+void print_cache(struct s_cache *sc){/* stub */}
+struct s_cache *new_cache(struct s_arena *arena, unsigned short size,
+                          unsigned short num_ptrs)
+{
+	return (struct s_cache*) (((unsigned int)size) << 16 + (unsigned int)num_ptrs);
+}
+
+/* already implemented */
+//struct s_arena *new_arena(void);
+struct s_cache *find_cache(struct s_cache **rsc, struct s_arena *arena,
+                           unsigned short size, unsigned short num_ptrs)
+{
+	return new_cache(arena,size,num_ptrs);
+}
+
+void gc_add_root(gc_t gc, void * root);
+void A_STD gc_perform_gc(gc_t gc);
+uint32_t get_heap_flags(void* sp){
+	/* TODO implement */
+	return 0;
+}
+
+heap_t A_STD s_alloc(gc_t gc, struct s_cache *sc){
+	unsigned int size  = 0xffff & (((unsigned int)sc)>>16);
+	unsigned int nptrs = 0xffff & (unsigned int)sc;
+	return (heap_t)(mem_allocate(arena,size,nptrs));
+}
+
+heap_t (gc_alloc)(gc_t gc,struct s_cache **sc, unsigned count, unsigned nptrs) A_STD;
+
+heap_t A_STD gc_array_alloc(gc_t gc, unsigned count) {
+	return (heap_t)(mem_allocate(arena,count,count));
+}
+
+heap_t A_STD gc_array_alloc_atomic(gc_t gc, unsigned count, unsigned slab_flags) {
+	return (heap_t)(mem_allocate(arena,count,0));
+}
+
+/* foreignptr, saved_gc must be set properly. */
+heap_t gc_malloc_foreignptr(unsigned alignment, unsigned size, bool finalizer) A_STD;
+
+heap_t gc_new_foreignptr(HsPtr ptr) A_STD;
+
+bool gc_add_foreignptr_finalizer(struct sptr* fp, HsFunPtr finalizer) A_STD;
+

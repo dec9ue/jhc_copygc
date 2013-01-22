@@ -1,0 +1,54 @@
+{-@Options
+
+# Code Options
+
+Various options affecting how jhc interprets and compiles code can be
+controlled with the '-f' flag, the following options are availible, you can
+negate any particular one by prepending 'no-' to it.
+
+
+Code options              
+------                    ---------------------------------------------------------------------------
+_bang-patterns_           - bang patterns
+_cpp_                     pass haskell source through c preprocessor
+_exists_                  - exists keyword for existential types recognized
+_ffi_                     support foreign function declarations
+_forall_                  - forall keyword for rank-n types and explicit quantification
+_m4_                      pass haskell source through m4 preprocessor
+_prelude_                 implicitly import Prelude
+_type-families_           type/data family support
+_unboxed-tuples_          allow unboxed tuple syntax to be recognized
+_unboxed-values_          allow unboxed value syntax
+_user-kinds_              user defined kinds
+
+Typechecking              
+------                    ---------------------------------------------------------------------------
+_defaulting_              perform defaulting of ambiguous types
+_monomorphism-restriction_ enforce monomorphism restriction
+
+Debugging                 
+------                    ---------------------------------------------------------------------------
+_lint_                    perform lots of extra type checks
+
+Optimization Options      
+------                    ---------------------------------------------------------------------------
+_global-optimize_         perform whole program E optimization
+_inline-pragmas_          use inline pragmas
+_rules_                   use rules
+_type-analysis_           perform a basic points-to analysis on types right after method generation
+
+Code Generation           
+------                    ---------------------------------------------------------------------------
+_boehm_                   use Boehm garbage collector
+_debug_                   enable debugging code in generated executable
+_full-int_                extend Int and Word to 32 bits on a 32 bit machine (rather than 30)
+_jgc_                     use the jgc garbage collector
+_profile_                 enable profiling code in generated executable
+_raw_                     just evaluate main to WHNF and nothing else.
+_standalone_              compile to a standalone executable
+_wrapper_                 wrap main in exception handler
+
+Default settings          
+------                    ---------------------------------------------------------------------------
+_default_                 inline-pragmas rules wrapper defaulting type-analysis monomorphism-restriction global-optimize full-int prelude
+_glasgow-exts_            forall ffi unboxed-tuples

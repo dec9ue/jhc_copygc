@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include "sys/queue.h"
 #include "HsFFI.h"
+#include "rts/cdefs.h"
+
 
 struct sptr;
 struct s_arena;
@@ -39,13 +41,37 @@ heap_t gc_malloc_foreignptr(unsigned alignment, unsigned size, bool finalizer) A
 heap_t gc_new_foreignptr(HsPtr ptr) A_STD;
 bool gc_add_foreignptr_finalizer(struct sptr* fp, HsFunPtr finalizer) A_STD;
 
-#define gc_frame0(gc,n,...) void *ptrs[n] = { __VA_ARGS__ }; \
-        for(int i = 0; i < n; i++) gc[i] = (sptr_t)ptrs[i]; \
-        gc_t sgc = gc;  gc_t gc = sgc + n;
-#define gc_frame1(gc,p1) gc[0] = (sptr_t)p1; gc_t sgc = gc;  gc_t gc = sgc + 1;
-#define gc_frame2(gc,p1,p2) gc[0] = (sptr_t)p1; gc[1] = (sptr_t)p2; \
-                                    gc_t sgc = gc;  gc_t gc = sgc + 2;
+#define gc_frame0(gc,n,...) void *ptrs[n+2] = { __VA_ARGS__ }; \
+	gc_t sgc = gc; gc_t gc = ptrs; \
+	ptrs[n] = NULL; ptrs[n+1] = (void*)sgc;
+#define	gc_frame1(gc,p1) gc_frame0(gc,1,p1)
+#define	gc_frame2(gc,p1,p2) gc_frame0(gc,2,p1,p2)
 
+/**
+   the gc_frame structure. 
+   +---------------+
+   | ptr[0]        | <- gc
+   +---------------+
+         :
+   | ptr[n]        | == NULL
+   +---------------+
++--+ ptr[n+1]      | == last_gc
+|  +---------------+
+|
+|  +---------------+
++->| ptr[0]        |
+   +---------------+
+         :
+   | ptr[n]        | == NULL
+   +---------------+
++--+ ptr[n+1]      | == last_gc
+|  +---------------+
+|
+|  +---------------+
++->| NULL          | : termination
+   +---------------+
+ 
+*/
 struct StablePtr {
     LIST_ENTRY(StablePtr) link;
     struct sptr* contents;

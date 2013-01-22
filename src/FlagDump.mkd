@@ -1,0 +1,86 @@
+{-@Options
+
+# Dumping Debugging Information
+
+You can have jhc print out a variety of things while running as Controlled by
+the '-d' flag. The following is a list of possible parameters you can pass to
+'-d'.
+
+
+Front End                 
+------                    ---------------------------------------------------------------------------
+_defs_                    Show all defined names in a module
+_derived_                 show generated derived instances
+_exports_                 show which names are exported from each module
+_imports_                 show in scope names for each module
+_ini_                     all ini configuration options
+_parsed_                  parsed code
+_preprocessed_            code after preprocessing/deliting
+_renamed_                 code after uniqueness renaming
+_scc-modules_             show strongly connected modules in dependency order
+
+Type Checker              
+------                    ---------------------------------------------------------------------------
+_all-types_               show unified type table, after everything has been typechecked
+_aspats_                  show as patterns
+_bindgroups_              show bindgroups
+_boxy-steps_              show step by step what the type inferencer is doing
+_class_                   detailed information on each class
+_class-summary_           summary of all classes
+_dcons_                   data constructors
+_decls_                   processed declarations
+_instance_                show instances
+_kind_                    show results of kind inference for each module
+_kind-steps_              show steps of kind inference
+_program_                 impl expls, the whole shebang.
+_sigenv_                  initial signature environment
+_srcsigs_                 processed signatures from source code
+_types_                   display unified type table containing all defined names
+
+Intermediate code         
+------                    ---------------------------------------------------------------------------
+_core_                    show intermediate core code
+_core-afterlift_          show final core before writing ho file
+_core-beforelift_         show core before lambda lifting
+_core-initial_            show core right after E.FromHs conversion
+_core-mangled_            de-typed core right before it is converted to grin
+_core-mini_               show details even when optimizing individual functions
+_core-pass_               show each iteration of code while transforming
+_core-steps_              show what happens in each pass
+_datatable_               show data table of constructors
+_datatable-builtin_       show data table entries for some built in types
+_e-alias_                 show expanded aliases
+_e-info_                  show info tags on all bound variables
+_e-size_                  print the size of E after each pass
+_e-verbose_               print very verbose version of E code always
+_optimization-stats_      show combined stats of optimization passes
+_rules_                   show all user rules and catalysts
+_rules-spec_              show specialization rules
+
+Grin code                 
+------                    ---------------------------------------------------------------------------
+_grin_                    dump all grin to the screen
+_grin-datalog_            print out grin information in a format suitable for loading into a database
+_grin-final_              final grin before conversion to C
+_grin-graph_              print dot file of final grin code to outputname_grin.dot
+_grin-initial_            grin right after conversion from core
+_grin-normalized_         grin right after first normalization
+_grin-posteval_           show grin code just before eval/apply inlining
+_grin-preeval_            show grin code just before eval/apply inlining
+_steps_                   show interpreter go
+_tags_                    list of all tags and their types
+
+Backend code              
+------                    ---------------------------------------------------------------------------
+_c_                       don't delete C source file after compilation
+
+Internal                  
+------                    ---------------------------------------------------------------------------
+_atom_                    dump atom table on exit
+
+General                   
+------                    ---------------------------------------------------------------------------
+_progress_                show basic progress indicators
+_stats_                   show extra information about stuff
+_verbose_                 progress
+_veryverbose_             progress stats
